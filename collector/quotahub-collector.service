@@ -1,0 +1,11 @@
+[Unit]
+Description=QuotaHub AI Quota Collector
+Documentation=https://github.com/quotahub
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/share/quotahub/quotahub-collector.py
+Environment=QUOTAHUB_LOG_LEVEL=INFO
+
+[Install]
+WantedBy=default.target

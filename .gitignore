@@ -1,0 +1,28 @@
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# QuotaHub runtime data
+status.json
+status.tmp
+
+# CodeGraph index
+.codegraph/

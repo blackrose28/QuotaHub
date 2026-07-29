@@ -1,0 +1,24 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "dev@quotahub.local",
+                "Name": "QuotaHub"
+            }
+        ],
+        "Category": "Utilities",
+        "Description": "Monitor AI subscription quota usage and reset times",
+        "EnabledByDefault": true,
+        "FormFactors": [
+            "desktop"
+        ],
+        "Icon": "speedometer",
+        "Id": "org.quotahub",
+        "License": "MIT",
+        "Name": "QuotaHub",
+        "Version": "0.1.0",
+        "Website": "https://github.com/quotahub"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
