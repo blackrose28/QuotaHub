@@ -10,9 +10,9 @@
       <default></default>
     </entry>
     <entry name="refreshIntervalSec" type="Int">
-      <default>30</default>
+      <default>900</default>
       <min>10</min>
-      <max>300</max>
+      <max>3600</max>
     </entry>
     <entry name="warningThreshold" type="Int">
       <default>60</default>

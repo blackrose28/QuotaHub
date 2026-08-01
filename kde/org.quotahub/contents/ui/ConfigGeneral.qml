@@ -48,8 +48,8 @@ KCM.SimpleKCM {
             id: refreshInterval
             Kirigami.FormData.label: i18n("Refresh interval (seconds):")
             from: 10
-            to: 300
-            stepSize: 5
+            to: 3600
+            stepSize: 60
         }
 
         Kirigami.Separator {

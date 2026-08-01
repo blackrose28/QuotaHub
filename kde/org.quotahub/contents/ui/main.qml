@@ -29,7 +29,7 @@ PlasmoidItem {
     Hub.DataReader {
         id: reader
         dataFilePath: Plasmoid.configuration.dataFilePath || ""
-        refreshIntervalSec: Plasmoid.configuration.refreshIntervalSec || 30
+        refreshIntervalSec: Plasmoid.configuration.refreshIntervalSec || 900
         warningThreshold: Plasmoid.configuration.warningThreshold || 60
         criticalThreshold: Plasmoid.configuration.criticalThreshold || 80
     }
@@ -92,10 +92,34 @@ PlasmoidItem {
         fileExec.run("cat '" + path + "' 2>/dev/null");
     }
 
+    // Trigger the collector service on-demand, then read the fresh data.
+    // Gated by a 60-second cooldown to avoid spamming the collector.
+    property real _lastCollectTime: 0
+
+    function collectAndRefresh() {
+        const now = Date.now();
+        if (now - _lastCollectTime < 60000) {
+            // Still in cooldown — just re-read the existing data
+            refresh();
+            return;
+        }
+        _lastCollectTime = now;
+        fileExec.run("systemctl --user start quotahub-collector.service");
+        delayedRefresh.restart();
+    }
+
+    // One-shot timer: read status.json shortly after the collector finishes
+    Timer {
+        id: delayedRefresh
+        interval: 3000
+        repeat: false
+        onTriggered: root.refresh()
+    }
+
     // --- periodic refresh ---
     Timer {
         id: refreshTimer
-        interval: Math.max(Plasmoid.configuration.refreshIntervalSec || 30, 10) * 1000
+        interval: Math.max(Plasmoid.configuration.refreshIntervalSec || 900, 10) * 1000
         running: true
         repeat: true
         onTriggered: root.refresh()
@@ -146,9 +170,10 @@ PlasmoidItem {
     compactRepresentation: CompactRepresentation {
         dataReader: reader
         onToggleExpanded: {
-            console.log("[QuotaHub] root type:", root, "root.expanded:", root.expanded);
             root.expanded = !root.expanded;
-            console.log("[QuotaHub] root.expanded is now:", root.expanded);
+            if (root.expanded) {
+                root.collectAndRefresh();
+            }
         }
     }
 
@@ -164,7 +189,7 @@ PlasmoidItem {
             anchors.left: parent.left
             anchors.right: parent.right
             dataReader: reader
-            onRefreshClicked: root.refresh()
+            onRefreshClicked: root.collectAndRefresh()
         }
     }
 }

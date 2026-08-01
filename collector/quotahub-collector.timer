@@ -1,9 +1,9 @@
 [Unit]
-Description=QuotaHub Collector Timer — runs every 5 minutes
+Description=QuotaHub Collector Timer — runs every 15 minutes
 
 [Timer]
 OnBootSec=10s
-OnUnitActiveSec=30s
+OnUnitActiveSec=15min
 Persistent=true
 
 [Install]

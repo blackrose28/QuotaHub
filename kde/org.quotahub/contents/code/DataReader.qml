@@ -15,7 +15,7 @@ QtObject {
 
     // --- public configuration ---
     property string dataFilePath: ""
-    property int refreshIntervalSec: 30
+    property int refreshIntervalSec: 900
     property int warningThreshold: 60
     property int criticalThreshold: 80
 
