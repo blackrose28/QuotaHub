@@ -8,6 +8,7 @@ Data sources
 ------------
 - Claude Code: OAuth usage endpoint (primary), local JSONL logs (fallback)
 - Antigravity: CloudCode internal API via D-Bus keyring credentials
+- Codex: ChatGPT backend API via ~/.codex/auth.json credentials
 """
 
 from __future__ import annotations
@@ -44,6 +45,12 @@ _AGY_GROUP_MAP: dict[str, tuple[str, str]] = {
     "gemini": ("agy_gemini", "Agy: Gemini"),
     "3p":     ("agy_3p",     "Agy: Claude/GPT"),
 }
+
+CODEX_AUTH_PATH = Path(os.environ.get(
+    "CODEX_HOME",
+    Path.home() / ".codex",
+)) / "auth.json"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 OUTPUT_DIR = Path(os.environ.get(
     "QUOTAHUB_DATA_DIR",
@@ -643,6 +650,205 @@ def collect_antigravity() -> list[ServiceStatus]:
     return []
 
 # ---------------------------------------------------------------------------
+# Codex — ChatGPT backend API
+# ---------------------------------------------------------------------------
+
+def _load_codex_credentials() -> str | None:
+    """Read the Codex CLI OAuth access token from ~/.codex/auth.json."""
+    if not CODEX_AUTH_PATH.is_file():
+        log.debug("Codex auth not found at %s", CODEX_AUTH_PATH)
+        return None
+
+    try:
+        data = json.loads(CODEX_AUTH_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Failed to read Codex auth file: %s", exc)
+        return None
+
+    # Only support ChatGPT-authenticated sessions
+    auth_mode = data.get("auth_mode", "")
+    if auth_mode != "chatgpt":
+        log.debug("Codex auth_mode is '%s', not 'chatgpt' — skipping", auth_mode)
+        return None
+
+    tokens = data.get("tokens") or {}
+    access_token = tokens.get("access_token", "")
+    if not access_token:
+        log.warning("No access_token in Codex auth file")
+        return None
+
+    # Check if the token might be stale (last_refresh > 1 hour ago)
+    last_refresh = data.get("last_refresh", "")
+    if last_refresh:
+        try:
+            from datetime import datetime, timezone  # noqa: PLC0415
+            refreshed_at = datetime.fromisoformat(last_refresh)
+            if refreshed_at.tzinfo is None:
+                refreshed_at = refreshed_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - refreshed_at).total_seconds()
+            if age_seconds > 3600:
+                log.info("Codex token is %.0f s old, attempting refresh", age_seconds)
+                _refresh_codex_token()
+                # Re-read after refresh
+                try:
+                    data = json.loads(CODEX_AUTH_PATH.read_text(encoding="utf-8"))
+                    tokens = data.get("tokens") or {}
+                    access_token = tokens.get("access_token", access_token)
+                except (json.JSONDecodeError, OSError):
+                    pass  # use the original token
+        except (ValueError, TypeError):
+            pass  # can't parse timestamp, proceed with existing token
+
+    return access_token
+
+
+def _refresh_codex_token() -> None:
+    """Spawn ``codex --version`` to trigger the CLI's internal token refresh.
+
+    The Codex CLI (Rust binary) refreshes its OAuth tokens on startup.
+    Using ``--version`` is a lightweight way to trigger this without
+    starting an interactive session.
+    """
+    import shutil
+    import subprocess
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        local_bin = Path.home() / ".local" / "bin" / "codex"
+        if local_bin.is_file():
+            codex_bin = str(local_bin)
+        else:
+            log.warning("codex CLI not found in PATH or ~/.local/bin/")
+            return
+
+    log.info("Refreshing Codex token via: %s --version", codex_bin)
+    try:
+        subprocess.run(
+            [codex_bin, "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Codex CLI token refresh timed out")
+    except OSError as exc:
+        log.warning("Failed to spawn codex CLI: %s", exc)
+
+
+def _query_codex_usage(access_token: str) -> dict[str, Any] | None:
+    """Query the ChatGPT backend usage endpoint for Codex quota data."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "codex-cli",
+        "Accept": "application/json",
+    }
+
+    req = urllib.request.Request(CODEX_USAGE_URL, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        log.warning("Codex usage endpoint returned HTTP %d: %s", exc.code, exc.reason)
+        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        log.warning("Failed to query Codex usage endpoint: %s", exc)
+        return None
+
+
+def _codex_plan_label(usage_data: dict[str, Any]) -> str:
+    """Derive a human-friendly plan label from the usage response."""
+    plan_type = usage_data.get("plan_type", "")
+    label_map = {
+        "plus": "Plus",
+        "pro": "Pro",
+        "business": "Business",
+        "enterprise": "Enterprise",
+        "team": "Team",
+    }
+    return label_map.get(plan_type.lower(), plan_type or "Unknown")
+
+
+def collect_codex() -> ServiceStatus | None:
+    """Collect Codex CLI quota data.
+
+    Returns a ServiceStatus on success, or None if Codex is not
+    configured / credentials are missing.
+    """
+    access_token = _load_codex_credentials()
+    if access_token is None:
+        return None
+
+    usage = _query_codex_usage(access_token)
+    if usage is None:
+        return ServiceStatus(
+            id="codex",
+            name="Codex",
+            status="error",
+            error="Usage endpoint unavailable",
+        )
+
+    plan = _codex_plan_label(usage)
+    rate_limit = usage.get("rate_limit") or {}
+
+    windows: list[UsageWindow] = []
+    worst_status = "ok"
+
+    # Primary window (typically 5-hour rolling)
+    primary = rate_limit.get("primary_window")
+    if primary and primary.get("used_percent") is not None:
+        pct = float(primary["used_percent"])
+        resets_at = None
+        reset_secs = primary.get("reset_after_seconds")
+        if reset_secs is not None:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            resets_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=int(reset_secs))
+            ).isoformat()
+        windows.append(UsageWindow(
+            name="5h rolling",
+            used_pct=round(pct, 1),
+            resets_at=resets_at,
+        ))
+        s = _status_from_utilization(pct)
+        if _status_severity(s) > _status_severity(worst_status):
+            worst_status = s
+
+    # Secondary window (typically weekly/daily)
+    secondary = rate_limit.get("secondary_window")
+    if secondary and secondary.get("used_percent") is not None:
+        pct = float(secondary["used_percent"])
+        resets_at = None
+        reset_secs = secondary.get("reset_after_seconds")
+        if reset_secs is not None:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            resets_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=int(reset_secs))
+            ).isoformat()
+        windows.append(UsageWindow(
+            name="weekly",
+            used_pct=round(pct, 1),
+            resets_at=resets_at,
+        ))
+        s = _status_from_utilization(pct)
+        if _status_severity(s) > _status_severity(worst_status):
+            worst_status = s
+
+    # If the endpoint says limit_reached but we have no window data
+    if rate_limit.get("limit_reached") and not windows:
+        worst_status = "exhausted"
+
+    return ServiceStatus(
+        id="codex",
+        name="Codex",
+        plan=plan,
+        status=worst_status,
+        windows=windows,
+    )
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -682,6 +888,15 @@ def run() -> None:
             log.info("%s: status=%s, windows=%d", svc.name, svc.status, len(svc.windows))
     except Exception:
         log.exception("Unexpected error collecting Antigravity data")
+
+    # Codex
+    try:
+        codex = collect_codex()
+        if codex is not None:
+            services.append(codex)
+            log.info("Codex: status=%s, windows=%d", codex.status, len(codex.windows))
+    except Exception:
+        log.exception("Unexpected error collecting Codex data")
 
     output = CollectorOutput(
         updated_at=datetime.now(timezone.utc).isoformat(),
