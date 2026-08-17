@@ -9,6 +9,7 @@ Data sources
 - Claude Code: OAuth usage endpoint (primary), local JSONL logs (fallback)
 - Antigravity: CloudCode internal API via D-Bus keyring credentials
 - Codex: ChatGPT backend API via ~/.codex/auth.json credentials
+- Command Code: commandcode.ai backend API via ~/.commandcode/auth.json API key
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,6 +53,34 @@ CODEX_AUTH_PATH = Path(os.environ.get(
     Path.home() / ".codex",
 )) / "auth.json"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
+COMMANDCODE_AUTH_PATH = Path.home() / ".commandcode" / "auth.json"
+COMMANDCODE_API_BASE = "https://api.commandcode.ai"
+
+# Monthly credit allotment and display label per plan ID, keyed by prefix
+# (plan IDs are occasionally versioned, e.g. "individual-pro-v1").
+_COMMANDCODE_PLAN_CREDITS: dict[str, float] = {
+    "individual-go": 10,
+    "individual-goat": 70,
+    "individual-pro-v1": 80,
+    "individual-pro": 30,
+    "individual-provider": 15,
+    "individual-max": 150,
+    "individual-ultra": 300,
+    "teams-pro": 40,
+}
+_COMMANDCODE_PLAN_LABELS: dict[str, str] = {
+    "individual-go": "Go",
+    "individual-goat": "GOAT",
+    "individual-pro-v1": "Pro",
+    "individual-pro": "Pro",
+    "individual-provider": "Provider",
+    "individual-max": "Max",
+    "individual-ultra": "Ultra",
+    "teams-pro": "Teams Pro",
+}
+# Longest prefix first, so "individual-pro-v1" matches before "individual-pro"
+_COMMANDCODE_PLAN_KEYS = sorted(_COMMANDCODE_PLAN_LABELS, key=len, reverse=True)
 
 OUTPUT_DIR = Path(os.environ.get(
     "QUOTAHUB_DATA_DIR",
@@ -849,6 +879,150 @@ def collect_codex() -> ServiceStatus | None:
     )
 
 # ---------------------------------------------------------------------------
+# Command Code — commandcode.ai backend API
+# ---------------------------------------------------------------------------
+
+def _load_commandcode_api_key() -> str | None:
+    """Read the Command Code CLI (``cmd``) API key from ~/.commandcode/auth.json."""
+    if not COMMANDCODE_AUTH_PATH.is_file():
+        log.debug("Command Code auth not found at %s", COMMANDCODE_AUTH_PATH)
+        return None
+
+    try:
+        data = json.loads(COMMANDCODE_AUTH_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("Failed to read Command Code auth file: %s", exc)
+        return None
+
+    api_key = data.get("apiKey")
+    if not api_key:
+        log.warning("No apiKey in Command Code auth file")
+        return None
+    return api_key
+
+
+def _commandcode_request(
+    path: str, api_key: str, params: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """GET a commandcode.ai backend endpoint using the CLI's bearer API key."""
+    url = f"{COMMANDCODE_API_BASE}{path}"
+    if params:
+        query = urllib.parse.urlencode(
+            {k: v for k, v in params.items() if v is not None},
+        )
+        if query:
+            url = f"{url}?{query}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": "command-code-cli",
+        "Accept": "application/json",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        log.warning("Command Code API %s returned HTTP %d", path, exc.code)
+        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        log.warning("Command Code API request to %s failed: %s", path, exc)
+        return None
+
+
+def _commandcode_plan_key(plan_id: str) -> str | None:
+    """Match a (possibly versioned) plan ID against the known plan prefixes."""
+    normalized = plan_id.lower().replace("_", "-")
+    for key in _COMMANDCODE_PLAN_KEYS:
+        if normalized.startswith(key):
+            return key
+    return None
+
+
+def _commandcode_plan_label(plan_id: str) -> str:
+    """Derive a human-friendly plan label from the subscription planId."""
+    if not plan_id:
+        return "Unknown"
+    key = _commandcode_plan_key(plan_id)
+    if key:
+        return _COMMANDCODE_PLAN_LABELS[key]
+    return plan_id.replace("-", " ").title()
+
+
+def collect_commandcode() -> ServiceStatus | None:
+    """Collect Command Code CLI (``cmd``) quota data.
+
+    Returns a ServiceStatus on success, or None if Command Code is not
+    configured / credentials are missing.
+    """
+    api_key = _load_commandcode_api_key()
+    if api_key is None:
+        return None
+
+    whoami = _commandcode_request("/alpha/whoami", api_key)
+    org_id = (whoami.get("org") or {}).get("id") if whoami else None
+
+    credits = _commandcode_request(
+        "/alpha/billing/credits", api_key, {"orgId": org_id},
+    )
+    if credits is None:
+        return ServiceStatus(
+            id="commandcode",
+            name="Command Code",
+            status="error",
+            error="Usage endpoint unavailable",
+        )
+
+    subscription = _commandcode_request(
+        "/alpha/billing/subscriptions", api_key, {"orgId": org_id},
+    )
+    plan_id = (subscription.get("data") or {}).get("planId", "") if subscription else ""
+    plan = _commandcode_plan_label(plan_id)
+
+    windows: list[UsageWindow] = []
+    worst_status = "ok"
+
+    window_limits = credits.get("windowLimits") or {}
+    if window_limits.get("limited"):
+        for key, label in (("fiveHour", "5h rolling"), ("weekly", "weekly")):
+            win = window_limits.get(key) or {}
+            cap = win.get("cap") or 0
+            if cap <= 0:
+                continue
+            pct = round(min(100.0, win.get("used", 0) / cap * 100), 1)
+            resets_at = None
+            reset_ms = win.get("resetAt")
+            if reset_ms:
+                resets_at = datetime.fromtimestamp(
+                    reset_ms / 1000, tz=timezone.utc,
+                ).isoformat()
+            windows.append(UsageWindow(name=label, used_pct=pct, resets_at=resets_at))
+            s = _status_from_utilization(pct)
+            if _status_severity(s) > _status_severity(worst_status):
+                worst_status = s
+
+    # Plans without a 5h/weekly rate cap deplete a monthly credit pool instead —
+    # fall back to that as a single window.
+    if not windows:
+        remaining = (credits.get("credits") or {}).get("monthlyCredits")
+        key = _commandcode_plan_key(plan_id)
+        total = _COMMANDCODE_PLAN_CREDITS.get(key) if key else None
+        if remaining is not None and total:
+            pct = round(min(100.0, max(0.0, (total - remaining) / total * 100)), 1)
+            windows.append(UsageWindow(name="monthly credits", used_pct=pct))
+            worst_status = _status_from_utilization(pct)
+
+    return ServiceStatus(
+        id="commandcode",
+        name="Command Code",
+        plan=plan,
+        status=worst_status,
+        windows=windows,
+    )
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -897,6 +1071,18 @@ def run() -> None:
             log.info("Codex: status=%s, windows=%d", codex.status, len(codex.windows))
     except Exception:
         log.exception("Unexpected error collecting Codex data")
+
+    # Command Code
+    try:
+        commandcode = collect_commandcode()
+        if commandcode is not None:
+            services.append(commandcode)
+            log.info(
+                "Command Code: status=%s, windows=%d",
+                commandcode.status, len(commandcode.windows),
+            )
+    except Exception:
+        log.exception("Unexpected error collecting Command Code data")
 
     output = CollectorOutput(
         updated_at=datetime.now(timezone.utc).isoformat(),

@@ -82,6 +82,7 @@ QtObject {
             case "agy_3p":        return "applications-science";
             case "codex":         return "code-context";
             case "opencode":      return "code-class";
+            case "commandcode":   return "utilities-terminal";
             default:              return "application-x-executable";
         }
     }
