@@ -13,6 +13,7 @@ A KDE Plasma 6 widget + systemd collector that monitors your AI subscription quo
 | **Claude Code** | Pro, Max 5×/20×, Team, Enterprise | 5 h rolling, weekly |
 | **Antigravity** (Gemini + Claude/GPT) | Free, Pro, Ultra | 5 h rolling, weekly |
 | **Codex** (OpenAI) | Plus, Pro, Business, Enterprise | 5 h rolling, weekly |
+| **Command Code** (`cmd`) | Go, GOAT, Pro, Provider, Max, Ultra, Teams Pro | 5 h rolling, weekly (or monthly credits) |
 
 ## How It Works
 
@@ -21,7 +22,8 @@ systemd timer (every 30 s)
     └─▶ quotahub-collector.py
             ├─ Claude Code OAuth usage API
             ├─ Antigravity CloudCode internal API
-            └─ Codex ChatGPT backend API
+            ├─ Codex ChatGPT backend API
+            └─ Command Code commandcode.ai backend API
                     └─▶ ~/.local/share/quotahub/status.json
                             └─▶ KDE Plasma widget reads & displays
 ```
@@ -59,6 +61,7 @@ After installation, right-click your panel → **Add Widgets** → search **"Quo
 - **python-dbus** — for reading Antigravity credentials from the system keyring
 - Active subscriptions to one or more of the supported services
 - For Codex support: the `codex` CLI must be installed and logged in (`~/.codex/auth.json` must exist)
+- For Command Code support: the `cmd` CLI must be installed and logged in (`~/.commandcode/auth.json` must exist)
 
 ## Configuration
 
