@@ -26,3 +26,6 @@ status.tmp
 
 # CodeGraph index
 .codegraph/
+
+# Command Code
+.commandcode/

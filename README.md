@@ -13,7 +13,7 @@ A KDE Plasma 6 widget + systemd collector that monitors your AI subscription quo
 | **Claude Code** | Pro, Max 5×/20×, Team, Enterprise | 5 h rolling, weekly |
 | **Antigravity** (Gemini + Claude/GPT) | Free, Pro, Ultra | 5 h rolling, weekly |
 | **Codex** (OpenAI) | Plus, Pro, Business, Enterprise | 5 h rolling, weekly |
-| **Command Code** (`cmd`) | Go, GOAT, Pro, Provider, Max, Ultra, Teams Pro | 5 h rolling, weekly (or monthly credits) |
+| **Command Code** (`cmd`) | Go, GOAT, Pro, Provider, Max, Ultra, Teams Pro | 5 h rolling, weekly, 30d quota |
 
 ## How It Works
 
