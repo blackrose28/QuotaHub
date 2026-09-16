@@ -1003,16 +1003,26 @@ def collect_commandcode() -> ServiceStatus | None:
             if _status_severity(s) > _status_severity(worst_status):
                 worst_status = s
 
-    # Plans without a 5h/weekly rate cap deplete a monthly credit pool instead —
-    # fall back to that as a single window.
-    if not windows:
-        remaining = (credits.get("credits") or {}).get("monthlyCredits")
-        key = _commandcode_plan_key(plan_id)
-        total = _COMMANDCODE_PLAN_CREDITS.get(key) if key else None
-        if remaining is not None and total:
-            pct = round(min(100.0, max(0.0, (total - remaining) / total * 100)), 1)
-            windows.append(UsageWindow(name="monthly credits", used_pct=pct))
-            worst_status = _status_from_utilization(pct)
+    # 30d monthly credit pool
+    c_data = credits.get("credits") or {}
+    monthly_rem = c_data.get("monthlyCredits")
+    purchased_rem = c_data.get("purchasedCredits", 0) or 0
+    free_rem = c_data.get("freeCredits", 0) or 0
+    sub_data = (subscription.get("data") or {}) if subscription else {}
+    current_period_end = sub_data.get("currentPeriodEnd")
+
+    key = _commandcode_plan_key(plan_id)
+    plan_allotment = _COMMANDCODE_PLAN_CREDITS.get(key) if key else None
+
+    if plan_allotment is not None and monthly_rem is not None:
+        total_pool = max(plan_allotment, monthly_rem) + purchased_rem + free_rem
+        total_remaining = monthly_rem + purchased_rem + free_rem
+        used = max(0.0, total_pool - total_remaining)
+        pct = round(min(100.0, used / total_pool * 100), 1) if total_pool > 0 else 0.0
+        windows.append(UsageWindow(name="30d", used_pct=pct, resets_at=current_period_end))
+        s = _status_from_utilization(pct)
+        if _status_severity(s) > _status_severity(worst_status):
+            worst_status = s
 
     return ServiceStatus(
         id="commandcode",
