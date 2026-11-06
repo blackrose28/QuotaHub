@@ -11,8 +11,8 @@ A KDE Plasma 6 widget + systemd collector that monitors your AI subscription quo
 | Service | Plan Detection | Quota Windows |
 |---------|---------------|---------------|
 | **Claude Code** | Pro, Max 5×/20×, Team, Enterprise | 5 h rolling, weekly |
-| **Antigravity** (Gemini + Claude/GPT) | Free, Pro, Ultra | 5 h rolling, weekly |
-| **Codex** (OpenAI) | Plus, Pro, Business, Enterprise | 5 h rolling, weekly |
+| **Antigravity** (Gemini + Claude/GPT) | Free, Pro, Ultra | 5 h rolling, weekly (per pool) |
+| **Codex** (OpenAI) | Plus, Pro, Business, Enterprise | weekly (5 h if the API returns a 5 h window) |
 | **Command Code** (`cmd`) | Go, GOAT, Pro, Provider, Max, Ultra, Teams Pro | 5 h rolling, weekly, 30d quota |
 
 ## How It Works

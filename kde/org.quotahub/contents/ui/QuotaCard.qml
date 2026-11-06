@@ -11,7 +11,8 @@ import org.kde.plasma.components as PlasmaComponents3
  *
  * Shows:
  *   - Service icon, name, plan badge, status indicator
- *   - Progress bar(s) for each usage window (5h rolling, weekly)
+ *   - Progress bar(s) for each usage window (5h rolling, weekly,
+ *     30d, etc. — whatever the collector emits, in order)
  *   - Countdown timer for reset
  */
 Item {
@@ -182,7 +183,9 @@ Item {
                     spacing: Kirigami.Units.smallSpacing
 
                     PlasmaComponents3.Label {
-                        text: win.name || "Window"
+                        text: cardRoot.dataReader
+                            ? cardRoot.dataReader.windowDisplayName(win)
+                            : (win.name || "Window")
                         font.pointSize: Kirigami.Theme.smallFont.pointSize
                         opacity: 0.7
                     }

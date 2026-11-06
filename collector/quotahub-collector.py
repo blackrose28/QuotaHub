@@ -576,6 +576,41 @@ def _fetch_agy_project(
     return project, plan
 
 
+def _agy_quota_window_name(window: str) -> str:
+    """Map an Antigravity bucket ``window`` value to a display name."""
+    return {"5h": "5h rolling", "weekly": "weekly"}.get(window, window or "unknown")
+
+
+def _build_agy_windows(buckets: list[dict[str, Any]]) -> list[UsageWindow]:
+    """Convert API buckets to display windows, deduplicated by window kind.
+
+    Buckets with the same window kind are collapsed to the worst
+    (lowest remainingFraction) value — one window per kind, e.g. a
+    single "5h rolling" and a single "weekly".
+    """
+    by_window: dict[str, dict[str, Any]] = {}
+    for bucket in buckets:
+        remaining = bucket.get("remainingFraction")
+        if remaining is None:
+            continue
+        name = _agy_quota_window_name(bucket.get("window", ""))
+        prev = by_window.get(name)
+        if prev is None or float(remaining) < float(prev["remainingFraction"]):
+            by_window[name] = bucket
+
+    windows = [
+        UsageWindow(
+            name=name,
+            used_pct=round((1.0 - float(b["remainingFraction"])) * 100, 1),
+            resets_at=b.get("resetTime"),
+        )
+        for name, b in by_window.items()
+    ]
+    _order = {"5h rolling": 0, "weekly": 1}
+    windows.sort(key=lambda w: _order.get(w.name, 2))
+    return windows
+
+
 def _fetch_agy_quota_summary(
     base_url: str, token: str, project: str, plan: str = "Unknown",
 ) -> list[ServiceStatus]:
@@ -599,31 +634,9 @@ def _fetch_agy_quota_summary(
             (f"agy_{group_key}", f"Agy: {group.get('displayName', group_key)}"),
         )
 
-        windows: list[UsageWindow] = []
-        worst_status = "ok"
-
-        for bucket in buckets:
-            remaining = bucket.get("remainingFraction")
-            if remaining is None:
-                continue
-            used_pct = round((1.0 - remaining) * 100, 1)
-            window_name = bucket.get("window", "")
-            display = "5h rolling" if window_name == "5h" else window_name
-
-            windows.append(UsageWindow(
-                name=display,
-                used_pct=used_pct,
-                resets_at=bucket.get("resetTime"),
-            ))
-
-            s = _status_from_utilization(used_pct)
-            if _status_severity(s) > _status_severity(worst_status):
-                worst_status = s
-
+        windows = _build_agy_windows(buckets)
         if windows:
-            # Sort: 5h rolling first, weekly second (match Claude Code order)
-            _window_order = {"5h rolling": 0, "weekly": 1}
-            windows.sort(key=lambda w: _window_order.get(w.name, 2))
+            worst_status = _status_from_utilization(max(w.used_pct or 0 for w in windows))
             results.append(ServiceStatus(
                 id=svc_id,
                 name=svc_name,
@@ -633,6 +646,85 @@ def _fetch_agy_quota_summary(
             ))
 
     return results
+
+
+def _fetch_agy_gemini_quota(
+    base_url: str, token: str, project: str, plan: str = "Unknown",
+) -> ServiceStatus | None:
+    """Fallback: get the Gemini pool from ``agy -p "/quota"`` JSON.
+
+    Google removed the ``gemini`` group from ``retrieveUserQuotaSummary``
+    for our credential (only "Claude and GPT models" is returned), so we
+    ask the agy CLI itself — the source of truth, which reports the full
+    per-group buckets including ``gemini-weekly`` and ``gemini-5h``.
+    """
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    agy_bin = shutil.which("agy")
+    if not agy_bin:
+        local_bin = Path.home() / ".local" / "bin" / "agy"
+        if local_bin.is_file():
+            agy_bin = str(local_bin)
+        else:
+            log.warning("agy CLI not found in PATH or ~/.local/bin/")
+            return None
+
+    try:
+        proc = subprocess.run(
+            [agy_bin, "-p", "/quota", "--output-format", "json"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Antigravity /quota command timed out")
+        return None
+    except OSError as exc:
+        log.warning("Failed to spawn agy CLI for /quota: %s", exc)
+        return None
+
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        log.warning("Failed to parse agy /quota output: %s", exc)
+        return None
+
+    groups = (data.get("command") or {}).get("data", {}).get("groups") or []
+    for group in groups:
+        verdict = _classify_agy_group(group, [
+            {"bucketId": (b.get("id") or "")} for b in group.get("buckets", [])
+        ])
+        if verdict != "gemini":
+            continue
+
+        buckets = []
+        for b in group.get("buckets", []):
+            remaining = b.get("remaining_fraction")
+            if remaining is None:
+                continue
+            buckets.append({
+                "window": b.get("window", ""),
+                "remainingFraction": remaining,
+                "resetTime": b.get("reset_time"),
+            })
+
+        windows = _build_agy_windows(buckets)
+        if windows:
+            worst_status = _status_from_utilization(
+                max(w.used_pct or 0 for w in windows),
+            )
+            svc_id, svc_name = _AGY_GROUP_MAP["gemini"]
+            return ServiceStatus(
+                id=svc_id,
+                name=svc_name,
+                plan=plan,
+                status=worst_status,
+                windows=windows,
+            )
+
+    return None
 
 
 def _classify_agy_group(
@@ -673,6 +765,11 @@ def collect_antigravity() -> list[ServiceStatus]:
         project, plan = result
 
         results = _fetch_agy_quota_summary(base_url, token, project, plan)
+        if not any(svc.id == "agy_gemini" for svc in results):
+            gemini_svc = _fetch_agy_gemini_quota(base_url, token, project, plan)
+            if gemini_svc is not None:
+                results.insert(0, gemini_svc)
+
         if results:
             return results
 
@@ -826,39 +923,53 @@ def collect_codex() -> ServiceStatus | None:
     windows: list[UsageWindow] = []
     worst_status = "ok"
 
-    # Primary window (typically 5-hour rolling)
-    primary = rate_limit.get("primary_window")
-    if primary and primary.get("used_percent") is not None:
-        pct = float(primary["used_percent"])
-        resets_at = None
-        reset_secs = primary.get("reset_after_seconds")
-        if reset_secs is not None:
-            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
-            resets_at = (
-                datetime.now(timezone.utc) + timedelta(seconds=int(reset_secs))
-            ).isoformat()
-        windows.append(UsageWindow(
-            name="5h rolling",
-            used_pct=round(pct, 1),
-            resets_at=resets_at,
-        ))
-        s = _status_from_utilization(pct)
-        if _status_severity(s) > _status_severity(worst_status):
-            worst_status = s
+    def _window_seconds(win: dict[str, Any]) -> int | None:
+        secs = win.get("limit_window_seconds")
+        if secs is not None:
+            try:
+                return int(secs)
+            except (TypeError, ValueError):
+                pass
+        # 7 days: Codex uses a weekly primary window, and the secondary
+        # window is null, but limit_reached resets map to the weekly cap.
+        # Kept for reference; the primary window label is derived below.
+        return None
 
-    # Secondary window (typically weekly/daily)
-    secondary = rate_limit.get("secondary_window")
-    if secondary and secondary.get("used_percent") is not None:
-        pct = float(secondary["used_percent"])
+    def _window_display_name(win: dict[str, Any], is_primary: bool) -> str:
+        secs = _window_seconds(win)
+        if secs is not None:
+            if secs <= 5 * 3600:
+                return "5h rolling"
+            if secs >= 7 * 24 * 3600:
+                return "weekly"
+            return f"{secs // 3600}h"
+        # Legacy fallback: today the primary window is weekly-only.
+        return "weekly" if is_primary else "weekly"
+
+    # Iterate both windows so a 5h window appears if the API ever
+    # returns one; label each by its limit_window_seconds, not by
+    # position, since Codex makes the primary window weekly.
+    for is_primary, win in (
+        (True, rate_limit.get("primary_window")),
+        (False, rate_limit.get("secondary_window")),
+    ):
+        if not win or win.get("used_percent") is None:
+            continue
+        pct = float(win["used_percent"])
         resets_at = None
-        reset_secs = secondary.get("reset_after_seconds")
+        reset_secs = win.get("reset_after_seconds")
         if reset_secs is not None:
             from datetime import datetime, timezone, timedelta  # noqa: PLC0415
             resets_at = (
                 datetime.now(timezone.utc) + timedelta(seconds=int(reset_secs))
             ).isoformat()
+        elif win.get("reset_at"):
+            from datetime import datetime, timezone  # noqa: PLC0415
+            resets_at = datetime.fromtimestamp(
+                int(win["reset_at"]), tz=timezone.utc,
+            ).isoformat()
         windows.append(UsageWindow(
-            name="weekly",
+            name=_window_display_name(win, is_primary),
             used_pct=round(pct, 1),
             resets_at=resets_at,
         ))

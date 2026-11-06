@@ -87,6 +87,30 @@ QtObject {
         }
     }
 
+    // Full window display name derived from the window name itself —
+    // the collector emits "5h rolling", "weekly", "30d", etc. and the
+    // widget shows them verbatim.
+    function windowDisplayName(win) {
+        if (!win || !win.name) return "Window";
+        return win.name;
+    }
+
+    function formatWindowDetail(windowsJson) {
+        try {
+            const windows = JSON.parse(windowsJson || "[]");
+            if (!Array.isArray(windows) || windows.length === 0) {
+                return "?";
+            }
+            return windows.map(function(w) {
+                const pct = (w.used_pct !== undefined && w.used_pct !== null)
+                    ? Math.round(w.used_pct) + "%" : "?";
+                return w.name + ": " + pct;
+            }).join(", ");
+        } catch (e) {
+            return "?";
+        }
+    }
+
     // --- countdown formatting ---
     function countdownText(isoResetTime) {
         if (!isoResetTime) {

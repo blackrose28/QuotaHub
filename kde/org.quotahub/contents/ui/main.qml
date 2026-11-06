@@ -155,13 +155,8 @@ PlasmoidItem {
         let lines = [];
         for (let i = 0; i < reader.servicesModel.count; i++) {
             const svc = reader.servicesModel.get(i);
-            const windows = JSON.parse(svc.windowsData || "[]");
-            let detail = svc.serviceName;
-            if (windows.length > 0) {
-                const w = windows[0];
-                detail += ": " + (w.used_pct !== undefined ? Math.round(w.used_pct) + "%" : "?");
-            }
-            lines.push(detail);
+            lines.push(svc.serviceName + ": "
+                + reader.formatWindowDetail(svc.windowsData || "[]"));
         }
         return lines.join("\n");
     }

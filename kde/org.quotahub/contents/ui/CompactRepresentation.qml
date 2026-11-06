@@ -11,7 +11,8 @@ import org.kde.plasma.core as PlasmaCore
  *
  * Shows a grid of colored dots:
  *   - Each column = one service
- *   - Stacked dots = usage window statuses (5h rolling, weekly, 30d, etc.)
+ *   - Stacked dots = usage window statuses (5h rolling, weekly,
+ *     30d, etc. — whatever the collector emits, in collector order)
  *
  * Colors:
  *   green (#4ade80) = ok
