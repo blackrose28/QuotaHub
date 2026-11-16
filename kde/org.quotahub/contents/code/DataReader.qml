@@ -18,6 +18,9 @@ QtObject {
     property int refreshIntervalSec: 900
     property int warningThreshold: 60
     property int criticalThreshold: 80
+    // Comma-separated service ids to hide (e.g. "codex,agy_3p")
+    property string disabledServices: ""
+    onDisabledServicesChanged: _reapply()
 
     // --- public read-only state ---
     readonly property bool hasData: servicesModel.count > 0
@@ -181,9 +184,28 @@ QtObject {
             return;
         }
 
+        _lastData = data;
+        _applyData(data);
+    }
+
+    property var _lastData: null
+
+    // Re-render cached data after the disabled-services setting changes
+    function _reapply() {
+        if (_lastData) {
+            _applyData(_lastData);
+        }
+    }
+
+    function _applyData(data) {
         _updatedAt = data.updated_at || "";
 
-        const services = data.services || [];
+        const disabled = (disabledServices || "").split(",")
+            .map(function(s) { return s.trim(); })
+            .filter(function(s) { return s.length > 0; });
+        const services = (data.services || []).filter(function(s) {
+            return disabled.indexOf(s.id) < 0;
+        });
         servicesModel.clear();
 
         let worstSev = 0;

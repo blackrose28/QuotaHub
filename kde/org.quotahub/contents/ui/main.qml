@@ -32,6 +32,7 @@ PlasmoidItem {
         refreshIntervalSec: Plasmoid.configuration.refreshIntervalSec || 900
         warningThreshold: Plasmoid.configuration.warningThreshold || 60
         criticalThreshold: Plasmoid.configuration.criticalThreshold || 80
+        disabledServices: Plasmoid.configuration.disabledServices || ""
     }
 
     // --- executable data source for file reading ---
@@ -83,6 +84,29 @@ PlasmoidItem {
             disconnectSource(sourceName);
         }
     }
+
+    // Share the disabled-services list with the collector via a small file
+    Plasma5Support.DataSource {
+        id: disabledWriter
+        engine: "executable"
+        connectedSources: []
+        onNewData: function(sourceName, data) { disconnectSource(sourceName); }
+    }
+
+    function syncDisabledServices() {
+        const ids = (Plasmoid.configuration.disabledServices || "")
+            .replace(/[^A-Za-z0-9_,]/g, "");
+        disabledWriter.connectSource(
+            "mkdir -p \"$HOME/.config/quotahub\" && printf '%s' '" + ids
+            + "' > \"$HOME/.config/quotahub/disabled_services\" # " + Date.now());
+    }
+
+    Connections {
+        target: Plasmoid.configuration
+        function onDisabledServicesChanged() { root.syncDisabledServices(); }
+    }
+
+    Component.onCompleted: syncDisabledServices()
 
     function refresh() {
         if (_resolvedHome.length === 0 && (Plasmoid.configuration.dataFilePath || "").trim().length === 0) {

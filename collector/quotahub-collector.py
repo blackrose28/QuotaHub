@@ -88,6 +88,20 @@ OUTPUT_DIR = Path(os.environ.get(
 ))
 OUTPUT_FILE = OUTPUT_DIR / "status.json"
 
+# Written by the Plasma widget: comma/newline-separated service ids to skip.
+DISABLED_FILE = Path(os.environ.get(
+    "QUOTAHUB_DISABLED_FILE",
+    Path.home() / ".config" / "quotahub" / "disabled_services",
+))
+
+
+def _load_disabled_services() -> set[str]:
+    try:
+        text = DISABLED_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    return {t.strip() for t in text.replace("\n", ",").split(",") if t.strip()}
+
 LOG_LEVEL = os.environ.get("QUOTAHUB_LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
@@ -1156,16 +1170,27 @@ def _serialize(obj: Any) -> Any:
     return obj
 
 
+class _Skip(Exception):
+    """Raised to skip a disabled service."""
+
+
 def run() -> None:
     log.info("QuotaHub collector starting")
 
     services: list[ServiceStatus] = []
+    disabled = _load_disabled_services()
+    if disabled:
+        log.info("Disabled services: %s", ", ".join(sorted(disabled)))
 
     # Claude Code
     try:
+        if "claude_code" in disabled:
+            raise _Skip
         claude = collect_claude_code()
         services.append(claude)
         log.info("Claude Code: status=%s, windows=%d", claude.status, len(claude.windows))
+    except _Skip:
+        pass
     except Exception:
         log.exception("Unexpected error collecting Claude Code data")
         services.append(ServiceStatus(
@@ -1177,24 +1202,34 @@ def run() -> None:
 
     # Antigravity (may produce multiple services)
     try:
-        agy_services = collect_antigravity()
+        if {"agy_gemini", "agy_3p"} <= disabled:
+            raise _Skip
+        agy_services = [s for s in collect_antigravity() if s.id not in disabled]
         for svc in agy_services:
             services.append(svc)
             log.info("%s: status=%s, windows=%d", svc.name, svc.status, len(svc.windows))
+    except _Skip:
+        pass
     except Exception:
         log.exception("Unexpected error collecting Antigravity data")
 
     # Codex
     try:
+        if "codex" in disabled:
+            raise _Skip
         codex = collect_codex()
         if codex is not None:
             services.append(codex)
             log.info("Codex: status=%s, windows=%d", codex.status, len(codex.windows))
+    except _Skip:
+        pass
     except Exception:
         log.exception("Unexpected error collecting Codex data")
 
     # Command Code
     try:
+        if "commandcode" in disabled:
+            raise _Skip
         commandcode = collect_commandcode()
         if commandcode is not None:
             services.append(commandcode)
@@ -1202,6 +1237,8 @@ def run() -> None:
                 "Command Code: status=%s, windows=%d",
                 commandcode.status, len(commandcode.windows),
             )
+    except _Skip:
+        pass
     except Exception:
         log.exception("Unexpected error collecting Command Code data")
 

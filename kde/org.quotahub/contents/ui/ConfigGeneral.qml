@@ -12,7 +12,29 @@ KCM.SimpleKCM {
 
     property alias cfg_dataFilePath: dataFilePath.text
     property alias cfg_refreshIntervalSec: refreshInterval.value
+    property string cfg_disabledServices: ""
     property alias cfg_warningThreshold: warningThreshold.value
+
+    readonly property var knownServices: [
+        { id: "claude_code", label: "Claude Code" },
+        { id: "agy_gemini", label: "Antigravity — Gemini pool" },
+        { id: "agy_3p", label: "Antigravity — Claude / 3rd-party pool" },
+        { id: "codex", label: "Codex" },
+        { id: "commandcode", label: "Command Code" }
+    ]
+
+    function isDisabled(id) {
+        return cfg_disabledServices.split(",").map(s => s.trim()).indexOf(id) >= 0;
+    }
+
+    function setDisabled(id, disabled) {
+        const list = cfg_disabledServices.split(",").map(s => s.trim())
+            .filter(s => s.length > 0 && s !== id);
+        if (disabled) {
+            list.push(id);
+        }
+        cfg_disabledServices = list.join(",");
+    }
     property alias cfg_criticalThreshold: criticalThreshold.value
 
     Kirigami.FormLayout {
@@ -33,6 +55,31 @@ KCM.SimpleKCM {
 
         QQC2.Label {
             text: i18n("Leave empty to use the default path. The collector writes quota data to this file.")
+            font: Kirigami.Theme.smallFont
+            opacity: 0.6
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
+        }
+
+        Kirigami.Separator {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("Services")
+        }
+
+        Repeater {
+            model: root.knownServices
+
+            QQC2.CheckBox {
+                required property var modelData
+                Kirigami.FormData.label: ""
+                text: modelData.label
+                checked: !root.isDisabled(modelData.id)
+                onToggled: root.setDisabled(modelData.id, !checked)
+            }
+        }
+
+        QQC2.Label {
+            text: i18n("Unchecked services are hidden from the panel and popup.")
             font: Kirigami.Theme.smallFont
             opacity: 0.6
             wrapMode: Text.WordWrap
