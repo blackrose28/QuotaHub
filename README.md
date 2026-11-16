@@ -65,9 +65,20 @@ After installation, right-click your panel → **Add Widgets** → search **"Quo
 
 ## Configuration
 
+### Disabling services
+
+Don't use every service? Right-click the widget → **Configure QuotaHub…** → **Services**, and uncheck the ones you want to hide (Claude Code, Antigravity Gemini pool, Antigravity Claude/3rd-party pool, Codex, Command Code).
+
+- Disabled services disappear immediately from the panel dots, popup cards, and tooltip, and no longer affect the overall status.
+- The widget writes the list to `~/.config/quotahub/disabled_services` (comma-separated service ids, e.g. `codex,agy_3p`), and the collector skips those services on its next run, so no API calls are made for them. Antigravity is skipped entirely only when both of its pools are disabled.
+- Re-enabling a service brings its data back after the next collector run.
+
+### Environment variables
+
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `QUOTAHUB_DATA_DIR` | `~/.local/share/quotahub` | Directory for `status.json` output |
+| `QUOTAHUB_DISABLED_FILE` | `~/.config/quotahub/disabled_services` | File listing service ids the collector should skip |
 | `QUOTAHUB_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 ## Project Structure
