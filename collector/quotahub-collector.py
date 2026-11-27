@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
 import os
+import socket
 import sys
 import time
 import urllib.request
@@ -103,13 +105,164 @@ def _load_disabled_services() -> set[str]:
     return {t.strip() for t in text.replace("\n", ",").split(",") if t.strip()}
 
 LOG_LEVEL = os.environ.get("QUOTAHUB_LOG_LEVEL", "INFO").upper()
+LOG_FILE = Path(os.environ.get(
+    "QUOTAHUB_LOG_FILE",
+    OUTPUT_DIR / "quotahub-collector.log",
+))
+LOG_MAX_BYTES = int(os.environ.get("QUOTAHUB_LOG_MAX_BYTES", str(1024 * 1024)))
+LOG_BACKUP_COUNT = int(os.environ.get("QUOTAHUB_LOG_BACKUP_COUNT", "5"))
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S",
-)
-log = logging.getLogger("quotahub")
+
+def _configure_logging() -> logging.Logger:
+    """Configure console + rotating file logging for the collector."""
+    logger = logging.getLogger("quotahub")
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(level)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=max(0, LOG_MAX_BYTES),
+            backupCount=max(0, LOG_BACKUP_COUNT),
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError as exc:
+        logger.warning("Failed to initialize log file %s: %s", LOG_FILE, exc)
+
+    return logger
+
+
+log = _configure_logging()
+
+_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+_HTTP_MAX_RETRIES = 3
+_HTTP_BASE_DELAY = 2.0
+
+
+def _wait_for_network(
+    host: str = "api.anthropic.com",
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> bool:
+    """Wait for DNS resolution to become ready (handles wake/boot races).
+
+    Tries immediately, then retries up to ``max_retries`` times with
+    exponential backoff (2s, 4s, 8s).
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            socket.getaddrinfo(host, 443)
+            if attempt > 0:
+                log.info("Network/DNS became ready after %d retry(ies)", attempt)
+            return True
+        except OSError as exc:
+            if attempt >= max_retries:
+                log.warning(
+                    "Network/DNS still unavailable after %d retries (%s); proceeding anyway",
+                    max_retries, exc,
+                )
+                return False
+            delay = base_delay * (2 ** attempt)
+            log.info(
+                "Network/DNS not ready (%s); waiting %.0fs before retry %d/%d",
+                exc, delay, attempt + 1, max_retries,
+            )
+            time.sleep(delay)
+    return False
+
+
+def _http_json_request(
+    label: str,
+    url: str,
+    headers: dict[str, str],
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    timeout: int = 10,
+    max_retries: int | None = None,
+) -> dict[str, Any] | None:
+    """Perform an HTTP JSON request with exponential backoff and error logging."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    retries = _HTTP_MAX_RETRIES if max_retries is None else max_retries
+
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        started = time.monotonic()
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+                elapsed_ms = (time.monotonic() - started) * 1000
+                parsed = json.loads(raw)
+                log.debug("%s %s %s -> HTTP %d (%.0f ms)", label, method, url, resp.status, elapsed_ms)
+                return parsed
+        except urllib.error.HTTPError as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            snippet = ""
+            try:
+                err_body = exc.read(512).decode("utf-8", errors="replace").strip()
+                if err_body:
+                    snippet = " | body=" + " ".join(err_body.split())
+            except OSError:
+                pass
+            retryable = exc.code in _RETRYABLE_HTTP_CODES and attempt < retries
+            if retryable:
+                delay = _HTTP_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    "%s %s %s returned HTTP %d (%s) in %.0f ms%s; retrying in %.0fs (%d/%d)",
+                    label, method, url, exc.code, exc.reason, elapsed_ms, snippet,
+                    delay, attempt + 1, retries,
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                "%s %s %s returned HTTP %d (%s) in %.0f ms%s",
+                label, method, url, exc.code, exc.reason, elapsed_ms, snippet,
+            )
+            return None
+        except (urllib.error.URLError, OSError) as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if attempt < retries:
+                delay = _HTTP_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    "%s %s %s failed (%s) in %.0f ms: %s; retrying in %.0fs (%d/%d)",
+                    label, method, url, type(exc).__name__, elapsed_ms, exc,
+                    delay, attempt + 1, retries,
+                )
+                time.sleep(delay)
+                continue
+            log.warning(
+                "%s %s %s failed (%s) in %.0f ms: %s",
+                label, method, url, type(exc).__name__, elapsed_ms, exc,
+            )
+            return None
+        except json.JSONDecodeError as exc:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            log.warning(
+                "%s %s %s returned invalid JSON in %.0f ms: %s",
+                label, method, url, elapsed_ms, exc,
+            )
+            return None
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -261,19 +414,7 @@ def _query_claude_oauth_usage(access_token: str) -> dict[str, Any] | None:
         "User-Agent": f"claude-code/{CLAUDE_CODE_VERSION}",
         "Accept": "application/json",
     }
-
-    req = urllib.request.Request(CLAUDE_USAGE_URL, headers=headers, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        log.warning("Claude usage endpoint returned HTTP %d: %s", exc.code, exc.reason)
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        log.warning("Failed to query Claude usage endpoint: %s", exc)
-        return None
+    return _http_json_request("Claude", CLAUDE_USAGE_URL, headers, method="GET")
 
 
 def _status_from_utilization(pct: float | None) -> str:
@@ -521,21 +662,14 @@ def _agy_request(
     url: str, token: str, body: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Send a POST request to the Antigravity CloudCode API."""
-    payload = json.dumps(body or {}).encode()
-    req = urllib.request.Request(url, data=payload, method="POST")
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("User-Agent", "antigravity")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        log.warning("Antigravity API %s returned HTTP %d", url, exc.code)
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        log.warning("Antigravity API request failed: %s", exc)
-        return None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity",
+    }
+    return _http_json_request(
+        "Antigravity", url, headers, method="POST", body=body or {},
+    )
 
 
 # Map known paidTier / currentTier IDs to short plan labels
@@ -584,6 +718,10 @@ def _fetch_agy_project(
         return None
     project = resp.get("cloudaicompanionProject", "")
     if not project:
+        log.warning(
+            "Antigravity %s/v1internal:loadCodeAssist returned no cloudaicompanionProject (keys=%s)",
+            base_url, sorted(resp.keys()),
+        )
         return None
     plan = _agy_plan_label(resp)
     log.debug("Antigravity plan detected: %s", plan)
@@ -884,19 +1022,7 @@ def _query_codex_usage(access_token: str) -> dict[str, Any] | None:
         "User-Agent": "codex-cli",
         "Accept": "application/json",
     }
-
-    req = urllib.request.Request(CODEX_USAGE_URL, headers=headers, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body)
-    except urllib.error.HTTPError as exc:
-        log.warning("Codex usage endpoint returned HTTP %d: %s", exc.code, exc.reason)
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        log.warning("Failed to query Codex usage endpoint: %s", exc)
-        return None
+    return _http_json_request("Codex", CODEX_USAGE_URL, headers, method="GET")
 
 
 def _codex_plan_label(usage_data: dict[str, Any]) -> str:
@@ -1044,17 +1170,7 @@ def _commandcode_request(
         "User-Agent": "command-code-cli",
         "Accept": "application/json",
     }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        log.warning("Command Code API %s returned HTTP %d", path, exc.code)
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
-        log.warning("Command Code API request to %s failed: %s", path, exc)
-        return None
+    return _http_json_request("Command Code", url, headers, method="GET")
 
 
 def _commandcode_plan_key(plan_id: str) -> str | None:
@@ -1174,8 +1290,28 @@ class _Skip(Exception):
     """Raised to skip a disabled service."""
 
 
+def _log_service_status(svc: ServiceStatus) -> None:
+    """Log the outcome of collecting a single service."""
+    if svc.status == "error":
+        log.warning("%s: status=%s, error=%s", svc.name, svc.status, svc.error)
+    else:
+        log.info(
+            "%s: status=%s, plan=%s, windows=%d",
+            svc.name, svc.status, svc.plan or "unknown", len(svc.windows),
+        )
+
+
 def run() -> None:
-    log.info("QuotaHub collector starting")
+    global _HTTP_MAX_RETRIES
+    run_started = time.monotonic()
+    log.info(
+        "QuotaHub collector starting (pid=%d, output=%s, log_file=%s)",
+        os.getpid(), OUTPUT_FILE, LOG_FILE,
+    )
+
+    # Wait briefly for DNS on wake-from-suspend / boot; if still offline after
+    # 3 retries, avoid repeating per-endpoint retry delays.
+    _HTTP_MAX_RETRIES = 3 if _wait_for_network() else 0
 
     services: list[ServiceStatus] = []
     disabled = _load_disabled_services()
@@ -1188,7 +1324,7 @@ def run() -> None:
             raise _Skip
         claude = collect_claude_code()
         services.append(claude)
-        log.info("Claude Code: status=%s, windows=%d", claude.status, len(claude.windows))
+        _log_service_status(claude)
     except _Skip:
         pass
     except Exception:
@@ -1207,7 +1343,7 @@ def run() -> None:
         agy_services = [s for s in collect_antigravity() if s.id not in disabled]
         for svc in agy_services:
             services.append(svc)
-            log.info("%s: status=%s, windows=%d", svc.name, svc.status, len(svc.windows))
+            _log_service_status(svc)
     except _Skip:
         pass
     except Exception:
@@ -1220,7 +1356,7 @@ def run() -> None:
         codex = collect_codex()
         if codex is not None:
             services.append(codex)
-            log.info("Codex: status=%s, windows=%d", codex.status, len(codex.windows))
+            _log_service_status(codex)
     except _Skip:
         pass
     except Exception:
@@ -1233,10 +1369,7 @@ def run() -> None:
         commandcode = collect_commandcode()
         if commandcode is not None:
             services.append(commandcode)
-            log.info(
-                "Command Code: status=%s, windows=%d",
-                commandcode.status, len(commandcode.windows),
-            )
+            _log_service_status(commandcode)
     except _Skip:
         pass
     except Exception:
@@ -1267,7 +1400,10 @@ def run() -> None:
             encoding="utf-8",
         )
         tmp_path.replace(OUTPUT_FILE)
-        log.info("Wrote %s", OUTPUT_FILE)
+        log.info(
+            "Wrote %s (%d services) in %.2fs",
+            OUTPUT_FILE, len(services), time.monotonic() - run_started,
+        )
     except OSError as exc:
         log.error("Failed to write output: %s", exc)
         sys.exit(1)

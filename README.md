@@ -80,6 +80,9 @@ Don't use every service? Right-click the widget → **Configure QuotaHub…** �
 | `QUOTAHUB_DATA_DIR` | `~/.local/share/quotahub` | Directory for `status.json` output |
 | `QUOTAHUB_DISABLED_FILE` | `~/.config/quotahub/disabled_services` | File listing service ids the collector should skip |
 | `QUOTAHUB_LOG_LEVEL` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `QUOTAHUB_LOG_FILE` | `~/.local/share/quotahub/quotahub-collector.log` | Rotating log file path |
+| `QUOTAHUB_LOG_MAX_BYTES` | `1048576` (1 MiB) | Maximum size in bytes before log rotation |
+| `QUOTAHUB_LOG_BACKUP_COUNT` | `5` | Number of rotated log backups to keep |
 
 ## Project Structure
 
